@@ -1,0 +1,24 @@
+[package]
+name = "rusty_chips"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[[example]]
+name = "simple"
+path = "examples/simple.rs"
+
+[dependencies]
+
+
+[dev-dependencies]
+
+
+# [profile.release]
+# strip = true        # Automatically strip debug symbols from the binary
+# opt-level = "z"     # Optimize for size
+# lto = true          # Enable link-time optimization
+# codegen-units = 1   # Use only one codegen unit to reduce binary size
+# panic = "abort"     # Abort on panic to reduce binary size
