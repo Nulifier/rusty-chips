@@ -1,5 +1,3 @@
 use rusty_chips::*;
 
-fn main() {
-	
-}
+fn main() {}

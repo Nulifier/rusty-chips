@@ -6,14 +6,11 @@ edition = "2021"
 [lib]
 path = "src/lib.rs"
 
-[[example]]
-name = "simple"
-path = "examples/simple.rs"
-
-[dependencies]
-
 
 [dev-dependencies]
+
+[dependencies]
+multimap = "0.10.0"
 
 
 # [profile.release]
