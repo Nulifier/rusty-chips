@@ -1,4 +1,4 @@
-use crate::assembler::position::Pos;
+use crate::compiler::position::Pos;
 use std::fmt;
 
 #[derive(Debug)]
@@ -8,6 +8,8 @@ pub enum ChipError {
 	UnexpectedEof,
 	SyntaxError(String, Pos),
 	UndefinedSymbol(String),
+	DuplicationSection(String),
+	ProgramTooLarge,
 }
 
 impl std::error::Error for ChipError {}
@@ -20,6 +22,8 @@ impl fmt::Display for ChipError {
 			ChipError::UnexpectedEof => write!(f, "Unexpected end of file"),
 			ChipError::SyntaxError(c, pos) => write!(f, "Syntax error: {}, at {}", c, pos),
 			ChipError::UndefinedSymbol(s) => write!(f, "Undefined symbol: {}", s),
+			ChipError::DuplicationSection(s) => write!(f, "Duplication section: {}", s),
+			ChipError::ProgramTooLarge => write!(f, "Program too large to fit in memory"),
 		}
 	}
 }

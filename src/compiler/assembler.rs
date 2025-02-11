@@ -1,29 +1,16 @@
+use super::program::Program;
+use super::scanner::{Instruction, LabelRefDirection, Scanner, Token, TokenType};
+use super::types::SectionIndex;
+use crate::compiler::types::{SectionName, SymbolName};
 use crate::error::{ChipError, Result};
 use multimap::MultiMap;
-use scanner::{Instruction, LabelRefDirection, Scanner, Token, TokenType};
 use std::iter::Peekable;
 use std::{collections::HashMap, rc::Rc};
-
-pub mod position;
-pub mod scanner;
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct SectionName(pub Rc<str>);
-#[derive(Debug, Clone, Copy)]
-pub struct SectionIndex(pub usize);
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct SymbolName(pub Rc<str>);
-
-impl SymbolName {
-	pub fn is_global(&self) -> bool {
-		!self.0.starts_with('_')
-	}
-}
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct NumericSymbol(pub u8);
 #[derive(Debug, Clone, Copy)]
-struct SectionOffset(pub usize);
+pub struct SectionOffset(pub usize);
 
 struct NumericLabelListEntry {
 	entry_type: NumericLabelListEntryType,
@@ -60,6 +47,18 @@ impl Section {
 			symbol_refs: MultiMap::new(),
 		}
 	}
+
+	pub fn name(&self) -> &SectionName {
+		&self.name
+	}
+
+	pub fn data(&self) -> &[u8] {
+		&self.data
+	}
+
+	pub fn symbols(&self) -> impl Iterator<Item = (&SymbolName, &SectionOffset)> {
+		self.symbol_defs.iter()
+	}
 }
 
 const CHECK_OPCODE_MASK: bool = true;
@@ -79,10 +78,13 @@ fn assert_opcode_mask(opcode: u16, mask: u16) {
 	}
 }
 
-pub struct Assembler<'a> {
+pub struct Assembler<'a, 'b> {
 	/// Scanner of the source file
 	//scanner: Scanner<'a>,
 	token_itr: Peekable<Scanner<'a>>,
+
+	/// Program to compile the source into
+	program: &'b mut Program,
 
 	/// Sections defined in the source file
 	sections: Vec<Section>,
@@ -97,11 +99,12 @@ pub struct Assembler<'a> {
 	numeric_label_list: Vec<NumericLabelListEntry>,
 }
 
-impl<'a> Assembler<'a> {
-	pub fn new(filename: Rc<str>, source: &'a str) -> Self {
+impl<'a, 'b> Assembler<'a, 'b> {
+	pub fn new(filename: Rc<str>, source: &'a str, program: &'b mut Program) -> Self {
 		let scanner = Scanner::new(filename, source);
 		Self {
 			token_itr: scanner.into_iter().peekable(),
+			program,
 			sections: Vec::from([Section::new(SectionName(Rc::from("text")))]),
 			current_section: SectionIndex(0),
 			global_symbols: HashMap::new(),
@@ -142,14 +145,19 @@ impl<'a> Assembler<'a> {
 		&self.sections[index.0]
 	}
 
+	/// Get an iterator over the sections
+	pub fn sections(&self) -> &Vec<Section> {
+		&self.sections
+	}
+
 	/**
 	 * Provides a concrete start location for a section.
 	 * This is used to update the symbol references with a concrete value.
 	 */
-	pub fn locate_section(
+	pub fn locate_sections(
 		&mut self,
-		section_starts: Vec<u16>,
-		global_symbols: HashMap<SymbolName, u16>,
+		section_starts: &Vec<usize>,
+		global_symbols: &HashMap<SymbolName, usize>,
 	) -> Result<()> {
 		for (i, this_section_start) in section_starts.iter().enumerate() {
 			let section = &mut self.sections[i];
@@ -170,13 +178,13 @@ impl<'a> Assembler<'a> {
 						.symbol_defs
 						.get(symbol)
 						.ok_or(ChipError::UndefinedSymbol(symbol.0.to_string()))?
-						.0 as u16 + this_section_start
+						.0 as usize + this_section_start
 				};
 
 				// Update each reference with the concrete address
 				for offset in references {
 					let offset = offset.0;
-					let [hi, lo] = addr.to_be_bytes();
+					let [hi, lo] = (addr as u16).to_be_bytes();
 					section.data[offset] |= hi;
 					section.data[offset + 1] |= lo;
 				}
@@ -192,18 +200,18 @@ impl<'a> Assembler<'a> {
 				NumericLabelListEntryType::ReferenceForward => {
 					let (section_index, section_offset) =
 						self.find_numeric_label_def_forward(entry.symbol, index)?;
-					section_offset.0 as u16 + section_starts[section_index.0]
+					section_offset.0 + section_starts[section_index.0]
 				}
 				NumericLabelListEntryType::ReferenceBackward => {
 					let (section_index, section_offset) =
 						self.find_numeric_label_def_backward(entry.symbol, index)?;
-					section_offset.0 as u16 + section_starts[section_index.0]
+					section_offset.0 + section_starts[section_index.0]
 				}
 			};
 
 			// Update the reference with the concrete address
 			let section = &mut self.sections[entry.section_index.0];
-			let [hi, lo] = addr.to_be_bytes();
+			let [hi, lo] = (addr as u16).to_be_bytes();
 			section.data[entry.section_offset.0] |= hi;
 			section.data[entry.section_offset.0 + 1] |= lo;
 		}

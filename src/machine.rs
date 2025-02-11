@@ -1,4 +1,4 @@
-const MEMORY_SIZE: usize = 4096;
+pub const MEMORY_SIZE: usize = 4096;
 const REGISTER_COUNT: usize = 16;
 const FRAME_WIDTH_BITS: usize = 64;
 const FRAME_HEIGHT_BITS: usize = 32;

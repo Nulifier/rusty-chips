@@ -1,6 +1,5 @@
-pub mod assembler;
+pub mod compiler;
 pub mod emulator;
 pub mod error;
-pub mod linker;
 pub mod machine;
 pub mod opcodes;

@@ -1,7 +1,8 @@
-use super::position::Pos;
 use std::iter::Peekable;
 use std::rc::Rc;
 use std::str::CharIndices;
+
+use crate::compiler::position::Pos;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum NumberBase {
