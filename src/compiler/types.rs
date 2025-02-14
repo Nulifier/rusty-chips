@@ -22,10 +22,6 @@ impl std::fmt::Display for MemOffset {
 	}
 }
 
-// This is a simple wrapper around a string to represent a section name
-#[derive(Debug, Clone, PartialEq)]
-pub struct SectionName(pub Rc<str>);
-
 // This is a simple wrapper around a string to represent a symbol name
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct SymbolName(pub Rc<str>);
@@ -41,6 +37,3 @@ impl SymbolName {
 		!self.0.starts_with('_')
 	}
 }
-
-#[derive(Debug, Clone, Copy)]
-pub struct SectionIndex(pub usize);

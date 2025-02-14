@@ -45,6 +45,9 @@ the reference.
 
 ### Directives
 
+#### `.start`
+Set the current cursor to 0x200 which is the start location of a Chip-8 program.
+
 ### Operands
 
 | Mode     | Format | Operand 1                 | Operand 2          |

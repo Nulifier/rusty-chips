@@ -417,6 +417,21 @@ impl<'a> Scanner<'a> {
 
 		while let Some(_) = self.advance_if(|c| c.is_numeric()) {}
 
+		// Check if this is actually a numeric label ref
+		if base == NumberBase::Decimal {
+			if let Some(c) = self.advance_if(|c| c == 'b' || c == 'f') {
+				let direction = match c {
+					'b' => LabelRefDirection::Backward,
+					'f' => LabelRefDirection::Forward,
+					_ => unreachable!(),
+				};
+				let mut token = self.make_token(TokenType::LabelRef(0, direction));
+				let num = token.text[0..token.text.len() - 1].parse::<u8>().unwrap(); // Should be okay as we validated this is a number
+				token.token_type = TokenType::LabelRef(num, direction);
+				return token;
+			}
+		}
+
 		let mut token = self.make_token(TokenType::Number(base, 0));
 
 		// Check that we don't have a stray "0x"

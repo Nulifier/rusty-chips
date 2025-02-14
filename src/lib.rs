@@ -3,3 +3,4 @@ pub mod emulator;
 pub mod error;
 pub mod machine;
 pub mod opcodes;
+mod utils;

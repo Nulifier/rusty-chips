@@ -1,65 +1,11 @@
 use super::program::Program;
 use super::scanner::{Instruction, LabelRefDirection, Scanner, Token, TokenType};
-use super::types::SectionIndex;
-use crate::compiler::types::{SectionName, SymbolName};
+use super::types::MemPtr;
+use crate::compiler::types::SymbolName;
 use crate::error::{ChipError, Result};
-use multimap::MultiMap;
+use std::collections::VecDeque;
 use std::iter::Peekable;
 use std::{collections::HashMap, rc::Rc};
-
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub struct NumericSymbol(pub u8);
-#[derive(Debug, Clone, Copy)]
-pub struct SectionOffset(pub usize);
-
-struct NumericLabelListEntry {
-	entry_type: NumericLabelListEntryType,
-	symbol: NumericSymbol,
-	section_index: SectionIndex,
-	section_offset: SectionOffset,
-}
-
-#[derive(PartialEq)]
-enum NumericLabelListEntryType {
-	Definition,
-	ReferenceForward,
-	ReferenceBackward,
-}
-
-/// Represents a section of the program
-pub struct Section {
-	/// Section name
-	name: SectionName,
-	/// Section data
-	data: Vec<u8>,
-	/// Map of symbol names to their offsets in the section
-	symbol_defs: HashMap<SymbolName, SectionOffset>,
-	/// Symbol references that need to be updated once the code is generated
-	symbol_refs: MultiMap<SymbolName, SectionOffset>,
-}
-
-impl Section {
-	pub fn new(name: SectionName) -> Self {
-		Self {
-			name,
-			data: Vec::new(),
-			symbol_defs: HashMap::new(),
-			symbol_refs: MultiMap::new(),
-		}
-	}
-
-	pub fn name(&self) -> &SectionName {
-		&self.name
-	}
-
-	pub fn data(&self) -> &[u8] {
-		&self.data
-	}
-
-	pub fn symbols(&self) -> impl Iterator<Item = (&SymbolName, &SectionOffset)> {
-		self.symbol_defs.iter()
-	}
-}
 
 const CHECK_OPCODE_MASK: bool = true;
 
@@ -86,17 +32,17 @@ pub struct Assembler<'a, 'b> {
 	/// Program to compile the source into
 	program: &'b mut Program,
 
-	/// Sections defined in the source file
-	sections: Vec<Section>,
+	/// Current position in the program memory
+	cursor: MemPtr,
 
-	current_section: SectionIndex,
+	/// Undefined symbols that need to be resolved
+	undefined_symbols: HashMap<SymbolName, MemPtr>,
 
-	/// Index of the section that the symbols are defined in
-	global_symbols: HashMap<SymbolName, SectionIndex>,
+	/// The last numeric labels that were defined for backwards labels
+	backward_numeric_labels: HashMap<u8, MemPtr>,
 
-	/// List of Numeric symbol definitions and references that need to be
-	/// updated once the code is generated.
-	numeric_label_list: Vec<NumericLabelListEntry>,
+	/// Forward numeric labels that need to be resolved
+	forward_numeric_labels: HashMap<u8, VecDeque<MemPtr>>,
 }
 
 impl<'a, 'b> Assembler<'a, 'b> {
@@ -105,10 +51,10 @@ impl<'a, 'b> Assembler<'a, 'b> {
 		Self {
 			token_itr: scanner.into_iter().peekable(),
 			program,
-			sections: Vec::from([Section::new(SectionName(Rc::from("text")))]),
-			current_section: SectionIndex(0),
-			global_symbols: HashMap::new(),
-			numeric_label_list: Vec::new(),
+			cursor: MemPtr(0),
+			undefined_symbols: HashMap::new(),
+			backward_numeric_labels: HashMap::new(),
+			forward_numeric_labels: HashMap::new(),
 		}
 	}
 
@@ -122,6 +68,7 @@ impl<'a, 'b> Assembler<'a, 'b> {
 				TokenType::Newline => continue,   // Empty statement
 				TokenType::Identifier => self.label_def(&token)?,
 				TokenType::Number(_, _) => self.numeric_label_def(&token)?,
+				TokenType::Dot => self.directive()?,
 				TokenType::EoF => break,
 
 				TokenType::Instruction(inst) => self.instruction(&token, inst)?,
@@ -130,153 +77,43 @@ impl<'a, 'b> Assembler<'a, 'b> {
 			}
 		}
 
-		Ok(())
-	}
-
-	pub fn get_section_index(&self, name: &str) -> Option<SectionIndex> {
-		self.sections
-			.iter()
-			.enumerate()
-			.find(|(_, section)| name == &*section.name.0)
-			.map(|(index, _)| SectionIndex(index))
-	}
-
-	pub fn get_section(&self, index: SectionIndex) -> &Section {
-		&self.sections[index.0]
-	}
-
-	/// Get an iterator over the sections
-	pub fn sections(&self) -> &Vec<Section> {
-		&self.sections
-	}
-
-	/**
-	 * Provides a concrete start location for a section.
-	 * This is used to update the symbol references with a concrete value.
-	 */
-	pub fn locate_sections(
-		&mut self,
-		section_starts: &Vec<usize>,
-		global_symbols: &HashMap<SymbolName, usize>,
-	) -> Result<()> {
-		for (i, this_section_start) in section_starts.iter().enumerate() {
-			let section = &mut self.sections[i];
-
-			// Update each identifier symbol defined in this section
-			for (symbol, references) in section.symbol_refs.iter_all() {
-				// Lookup the concrete address of the symbol
-				let addr = if symbol.is_global() {
-					// Lookup the symbol in the global symbol table
-					// Address is the global address
-					*global_symbols
-						.get(symbol)
-						.ok_or(ChipError::UndefinedSymbol(symbol.0.to_string()))?
-				} else {
-					// Lookup the symbol in the current section
-					// Address is the section offset + the section start
-					section
-						.symbol_defs
-						.get(symbol)
-						.ok_or(ChipError::UndefinedSymbol(symbol.0.to_string()))?
-						.0 as usize + this_section_start
-				};
-
-				// Update each reference with the concrete address
-				for offset in references {
-					let offset = offset.0;
-					let [hi, lo] = (addr as u16).to_be_bytes();
-					section.data[offset] |= hi;
-					section.data[offset + 1] |= lo;
-				}
-			}
+		// Error out on any unresolved forward references
+		if !self.forward_numeric_labels.is_empty() {
+			return Err(ChipError::UndefinedSymbol(
+				"Undefined numeric label references found".to_string(),
+			));
 		}
 
-		// Update each numeric label reference
-		for (index, entry) in self.numeric_label_list.iter().enumerate() {
-			// Find the address of the target label
-			let addr = match entry.entry_type {
-				// Skip definitions
-				NumericLabelListEntryType::Definition => continue,
-				NumericLabelListEntryType::ReferenceForward => {
-					let (section_index, section_offset) =
-						self.find_numeric_label_def_forward(entry.symbol, index)?;
-					section_offset.0 + section_starts[section_index.0]
-				}
-				NumericLabelListEntryType::ReferenceBackward => {
-					let (section_index, section_offset) =
-						self.find_numeric_label_def_backward(entry.symbol, index)?;
-					section_offset.0 + section_starts[section_index.0]
-				}
-			};
-
-			// Update the reference with the concrete address
-			let section = &mut self.sections[entry.section_index.0];
-			let [hi, lo] = (addr as u16).to_be_bytes();
-			section.data[entry.section_offset.0] |= hi;
-			section.data[entry.section_offset.0 + 1] |= lo;
+		// Resolve symbolic references
+		for (symbol, addr) in self.undefined_symbols.iter() {
+			if let Some(symbol_addr) = self.program.get_symbol(symbol) {
+				self.program
+					.set_short(*addr, self.program.get_short(*addr)? | symbol_addr.0)?;
+			} else {
+				return Err(ChipError::UndefinedSymbol(format!(
+					"Symbol {} not found",
+					symbol.0
+				)));
+			}
 		}
 
 		Ok(())
-	}
-
-	fn find_numeric_label_def_forward(
-		&self,
-		num: NumericSymbol,
-		start_index: usize,
-	) -> Result<(SectionIndex, SectionOffset)> {
-		// Find the next definition of the numeric label after start_index
-		for (_, entry) in self.numeric_label_list.iter().enumerate().skip(start_index) {
-			if entry.entry_type == NumericLabelListEntryType::Definition && entry.symbol == num {
-				return Ok((entry.section_index, entry.section_offset));
-			}
-		}
-		Err(ChipError::UndefinedSymbol(format!(
-			"Numeric label {} not found",
-			num.0
-		)))
-	}
-
-	fn find_numeric_label_def_backward(
-		&self,
-		num: NumericSymbol,
-		start_index: usize,
-	) -> Result<(SectionIndex, SectionOffset)> {
-		// Find the next definition of the numeric label after start_index
-		for (_, entry) in self
-			.numeric_label_list
-			.iter()
-			.enumerate()
-			.skip(start_index)
-			.rev()
-		{
-			if entry.entry_type == NumericLabelListEntryType::Definition {
-				if entry.symbol == num {
-					return Ok((entry.section_index, entry.section_offset));
-				}
-			}
-		}
-		Err(ChipError::UndefinedSymbol(format!(
-			"Numeric label {} not found",
-			num.0
-		)))
 	}
 
 	fn label_def(&mut self, token: &Token<'_>) -> Result<()> {
 		// Get the label name
 		let label = SymbolName(Rc::from(token.text()));
 
-		// Add the symbol to the current section's symbol table
-		let section: &mut Section = &mut self.sections[self.current_section.0];
-
-		section
-			.symbol_defs
-			.insert(label.clone(), SectionOffset(section.data.len()));
-
-		// Check if this symbol is global
-		if label.is_global() {
-			self.global_symbols
-				.insert(label.clone(), self.current_section);
+		// Check that this isn't a duplicate symbol
+		if self.program.has_symbol(&label) {
+			return Err(ChipError::DuplicateSymbol(
+				String::from("Duplicate symbol"),
+				token.pos().clone(),
+			));
 		}
+
+		// Add the symbol to the program's symbol table
+		self.program.add_symbol(label.clone(), self.cursor.clone());
 
 		// Skip the colon
 		self.expect_next_token(TokenType::Colon, "Expected colon after label")?;
@@ -285,30 +122,60 @@ impl<'a, 'b> Assembler<'a, 'b> {
 	}
 
 	fn numeric_label_def(&mut self, token: &Token<'_>) -> Result<()> {
-		// Get the label name
+		let addr = self.cursor;
+
+		// Get the label number
 		let label = match token.token_type() {
-			TokenType::Number(_, n) => NumericSymbol(n as u8),
+			TokenType::Number(_, n) => n as u8,
 			_ => unreachable!(),
 		};
 
 		// Check that the number is a valid numeric label
-		if label.0 > 99 {
+		if label > 99 {
 			return Err(ChipError::SyntaxError(
 				String::from("Numeric label must be between 0 and 99"),
 				token.pos().clone(),
 			));
 		}
 
-		// Add the symbol def to the list of numeric symbols
-		self.numeric_label_list.push(NumericLabelListEntry {
-			entry_type: NumericLabelListEntryType::Definition,
-			symbol: label,
-			section_index: self.current_section,
-			section_offset: SectionOffset(self.sections[self.current_section.0].data.len()),
-		});
+		// Record the location of this label for future backward references
+		self.backward_numeric_labels.insert(label, self.cursor);
+
+		// Check for any forward references to this label
+		if let Some(forward_refs) = self.forward_numeric_labels.remove(&label) {
+			// Update each of the forward references with the current address
+			for forward_ref in forward_refs {
+				// Since the bits in the placeholder opcode are zero, or the address with them
+				self.program
+					.set_short(forward_ref, self.program.get_short(addr)? | addr.0)?;
+			}
+		}
 
 		// Skip the colon
 		self.expect_next_token(TokenType::Colon, "Expected colon after label")?;
+
+		Ok(())
+	}
+
+	fn directive(&mut self) -> Result<()> {
+		let identifier = self.expect_next_token(
+			TokenType::Identifier,
+			"Directives must be an identifier following a dot",
+		)?;
+
+		match identifier.text() {
+			"start" => {
+				self.cursor = MemPtr(0x200);
+			}
+			_ => {
+				return Err(ChipError::SyntaxError(
+					format!("Unknown directive: {}", identifier.text()),
+					identifier.pos().clone(),
+				))
+			}
+		}
+
+		self.expect_statement_end()?;
 
 		Ok(())
 	}
@@ -385,9 +252,7 @@ impl<'a, 'b> Assembler<'a, 'b> {
 	/// Emit an instruction with no operands
 	fn instruction_0000(&mut self, opcode: u16) -> Result<()> {
 		// Emit the opcode
-		self.emit_short(opcode);
-
-		Ok(())
+		self.emit_short(opcode)
 	}
 
 	/// Emit an instruction with a short operand (literal or label)
@@ -399,46 +264,40 @@ impl<'a, 'b> Assembler<'a, 'b> {
 		match self.token_itr.peek() {
 			Some(token) if matches!(token.token_type(), TokenType::Number { .. }) => {
 				let literal = self.expect_next_12bit()?;
-				self.emit_short(opcode | literal);
+				self.emit_short(opcode | literal)?;
 			}
 			Some(token) if token.token_type() == TokenType::Identifier => {
 				let token = self.expect_next_token(TokenType::Identifier, "Expected label")?;
 				let label = SymbolName(Rc::from(token.text()));
-				let addr = self.sections[self.current_section.0].data.len();
-				self.sections[self.current_section.0]
-					.symbol_refs
-					.insert(label, SectionOffset(addr));
+
+				// Remember to come back for this one later
+				self.undefined_symbols.insert(label, self.cursor);
+
 				// Emit a placeholder for the label, the actual address will be
 				// resolved later.
-				self.emit_short(opcode);
+				self.emit_short(opcode)?;
 			}
 			Some(token) if matches!(token.token_type(), TokenType::LabelRef { .. }) => {
 				let label = self.token_itr.next().unwrap();
 				if let TokenType::LabelRef(num, dir) = label.token_type() {
-					if dir == LabelRefDirection::Forward {
-						self.numeric_label_list.push(NumericLabelListEntry {
-							entry_type: NumericLabelListEntryType::ReferenceForward,
-							symbol: NumericSymbol(num),
-							section_index: self.current_section,
-							section_offset: SectionOffset(
-								self.sections[self.current_section.0].data.len(),
-							),
-						});
+					let addr = if dir == LabelRefDirection::Forward {
+						// We're looking for the next numerical symbol in the program
+						// Since we can't see the future, we'll record it for later
+						self.forward_numeric_labels
+							.entry(num)
+							.or_insert_with(|| VecDeque::new())
+							.push_back(self.cursor);
+						MemPtr(0)
 					} else if dir == LabelRefDirection::Backward {
-						self.numeric_label_list.push(NumericLabelListEntry {
-							entry_type: NumericLabelListEntryType::ReferenceBackward,
-							symbol: NumericSymbol(num),
-							section_index: self.current_section,
-							section_offset: SectionOffset(
-								self.sections[self.current_section.0].data.len(),
-							),
-						});
+						// We're looking for the last time we defined this label
+						*self.backward_numeric_labels.get(&num).ok_or(
+							ChipError::UndefinedSymbol(format!("Numeric label {} not found", num)),
+						)?
 					} else {
 						unreachable!();
-					}
-					// Emit a placeholder for the label, the actual address will be
-					// resolved later.
-					self.emit_short(opcode);
+					};
+					// We may have the address, emit the instruction
+					self.emit_short(opcode | addr.0)?;
 				} else {
 					unreachable!();
 				}
@@ -462,9 +321,7 @@ impl<'a, 'b> Assembler<'a, 'b> {
 		let literal = self.expect_next_byte()?;
 		let register = self.expect_next_nibble()?;
 
-		self.emit_short(opcode | ((register as u16) << 8) | (literal as u16));
-
-		Ok(())
+		self.emit_short(opcode | ((register as u16) << 8) | (literal as u16))
 	}
 
 	/// Emit an instruction with two register operands. f(s) => t
@@ -474,9 +331,7 @@ impl<'a, 'b> Assembler<'a, 'b> {
 		let s = self.expect_next_register()?;
 		let t = self.expect_next_register()?;
 
-		self.emit_short(opcode | ((s as u16) << 8) | ((t as u16) << 4));
-
-		Ok(())
+		self.emit_short(opcode | ((s as u16) << 8) | ((t as u16) << 4))
 	}
 
 	/// Emit an instruction with two register operands. f(s) => t
@@ -486,9 +341,7 @@ impl<'a, 'b> Assembler<'a, 'b> {
 		let s = self.expect_next_register()?;
 		let t = self.expect_next_register()?;
 
-		self.emit_short(opcode | ((t as u16) << 8) | ((s as u16) << 4));
-
-		Ok(())
+		self.emit_short(opcode | ((t as u16) << 8) | ((s as u16) << 4))
 	}
 
 	/// Emit an instruction with a byte and two register operands. f(n, s) => t
@@ -499,9 +352,7 @@ impl<'a, 'b> Assembler<'a, 'b> {
 		let s = self.expect_next_register()?;
 		let t = self.expect_next_register()?;
 
-		self.emit_short(opcode | ((s as u16) << 8) | ((t as u16) << 4) | n as u16);
-
-		Ok(())
+		self.emit_short(opcode | ((s as u16) << 8) | ((t as u16) << 4) | n as u16)
 	}
 
 	/// Emit an instruction with a register operand. f(s)
@@ -509,9 +360,7 @@ impl<'a, 'b> Assembler<'a, 'b> {
 		assert_opcode_mask(opcode, 0xF0FF);
 
 		let s = self.expect_next_register()?;
-		self.emit_short(opcode | ((s as u16) << 8));
-
-		Ok(())
+		self.emit_short(opcode | ((s as u16) << 8))
 	}
 
 	/// Emit an instruction with a half byte operand. f(n)
@@ -520,9 +369,7 @@ impl<'a, 'b> Assembler<'a, 'b> {
 
 		let n = self.expect_next_nibble()?;
 
-		self.emit_short(opcode | n as u16);
-
-		Ok(())
+		self.emit_short(opcode | n as u16)
 	}
 
 	/// Emit an instruction with a half byte operand. f(n)
@@ -531,9 +378,7 @@ impl<'a, 'b> Assembler<'a, 'b> {
 
 		let n = self.expect_next_nibble()?;
 
-		self.emit_short(opcode | ((n as u16) << 8));
-
-		Ok(())
+		self.emit_short(opcode | ((n as u16) << 8))
 	}
 
 	fn expect_next_token(
@@ -662,11 +507,10 @@ impl<'a, 'b> Assembler<'a, 'b> {
 		}
 	}
 
-	fn emit_short(&mut self, short: u16) {
-		let [hi, lo] = short.to_be_bytes();
-		let section: &mut Section = &mut self.sections[self.current_section.0];
-		section.data.push(hi);
-		section.data.push(lo);
+	fn emit_short(&mut self, short: u16) -> Result<()> {
+		self.program.set_short(self.cursor, short)?;
+		self.cursor.0 += 2;
+		Ok(())
 	}
 }
 
@@ -675,23 +519,31 @@ mod test {
 	use super::*;
 
 	#[test]
-	fn test_simple() -> std::result::Result<(), String> {
+	fn test_assembler() -> std::result::Result<(), String> {
 		let source = r#"
 		# This is a comment
+		AUDIO
 main:	CLR
 		SYS 0x204
-		JUMP main
+1:		JUMP main
+		JUMP 2f
+		JUMP 1b
+2:		EXIT
 		"#;
 
-		let mut asm = Assembler::new(Rc::from("example.txt"), source);
+		let mut prog = Program::new(Rc::from("test"));
+		let mut asm = Assembler::new(Rc::from("example.txt"), source, &mut prog);
 		asm.compile().map_err(|e| e.to_string())?;
 
-		let idx = asm.get_section_index("text").unwrap();
-		let section = asm.get_section(idx);
+		assert_eq!(prog.data()[0..2], vec![0xF0, 0x02]); // AUDIO
+		assert_eq!(prog.data()[2..4], vec![0x00, 0xE0]); // CLR
+		assert_eq!(prog.data()[4..6], vec![0x02, 0x04]); // SYS 0x204
+		assert_eq!(prog.data()[6..8], vec![0x10, 0x02]); // JUMP main
+		assert_eq!(prog.data()[10..12], vec![0x10, 0x06]); // JUMP 2f
+		assert_eq!(prog.data()[10..12], vec![0x10, 0x06]); // JUMP 1b
+		assert_eq!(prog.data()[12..14], vec![0x00, 0xFD]); // EXIT
 
-		assert_eq!(section.data[0..2], vec![0x00, 0xE0]);
-		assert_eq!(section.data[2..4], vec![0x02, 0x04]);
-		assert_eq!(section.data[4..6], vec![0x10, 0x00]);
+		println!("{}", prog);
 
 		Ok(())
 	}
